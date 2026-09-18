@@ -167,6 +167,40 @@ function mergeTravelRecord(prior, next) {
   return merged;
 }
 
+/**
+ * 用官方行程历史修正缓存里的当日记录（纯函数）。
+ *
+ * 缓存擅长节流（派发重试间隔、多账号并发去重），但对「今天领过没」只能推断：
+ * 跨日补领、换设备、在网页端手动领取，都会让缓存里的 claimed 失真。
+ * 失真的方向是「缓存以为没领」，于是重复 claim，并且永远凑不齐「今日完成」。
+ *
+ * 只有 records 给出确定答案时才补充确认；查不到（reconciliation 为空，
+ * 或今天确实没领）一律原样返回 —— 宁可多试一次幂等 claim，
+ * 也不能反过来把真领过的记录抹掉。
+ */
+function applyDaySettlement(prior, reconciliation, today) {
+  const base = prior && typeof prior === 'object' ? { ...prior } : {};
+  if (!reconciliation || typeof reconciliation !== 'object') return base;
+  if (reconciliation.claimedToday !== true) return base;
+  const claims = Array.isArray(reconciliation.claimedRecords) ? reconciliation.claimedRecords : [];
+  const latest = claims.length ? claims[claims.length - 1] : {};
+  const date = nonEmptyString(today) || nonEmptyString(reconciliation.today);
+  base.ok = true;
+  base.claimed = true;
+  if (date) base.date = date;
+  if (!(Number(base.claimedAt) > 0) && Number(latest.claimedAt) > 0) base.claimedAt = Number(latest.claimedAt);
+  if (nonZeroCredit(base.rewardCredit) === null) {
+    const credit = nonZeroCredit(latest.rewardCredit);
+    if (credit !== null) base.rewardCredit = credit;
+  }
+  if (!nonEmptyString(base.location)) {
+    const name = nonEmptyString(latest.location);
+    if (name) base.location = name;
+  }
+  if (!nonEmptyString(base.state)) base.state = 'idle';
+  return base;
+}
+
 /** 只要还有可重试的跳过，今天就不算办完（参考项目在这点上踩过坑：no-buddy 被标完成后再也不重试）。 */
 /**
  * 当日完成标记：所有账号都已到达终态才算完成。
@@ -198,7 +232,13 @@ function planTravelStep(input) {
   const mode = options.mode === 'depart' || options.mode === 'claim' ? options.mode : 'auto';
   const now = Number(options.now) || Date.now();
   const retryMs = Number(options.retryMs) > 0 ? Number(options.retryMs) : TRAVEL_DEPART_RETRY_MS;
-  const prior = options.prior && typeof options.prior === 'object' ? options.prior : {};
+  // 权威行程历史优先于缓存推断：调用方把 reconcileToday() 的结果放进 options.reconciliation 即可，
+  // 不传时行为与从前完全一致。
+  const prior = applyDaySettlement(
+    options.prior && typeof options.prior === 'object' ? options.prior : {},
+    options.reconciliation,
+    options.today,
+  );
   const status = options.status && typeof options.status === 'object' ? options.status : {};
   if (!status.ok) {
     return { action: 'error', reason: String(status.error || '查询旅行状态失败'), skip: 'status-error' };
@@ -426,6 +466,7 @@ module.exports = {
   travelDueForRetry,
   rollTravelCacheToToday,
   mergeTravelRecord,
+  applyDaySettlement,
   travelCacheCompleted,
   truncateTravelMessage,
   planTravelStep,
